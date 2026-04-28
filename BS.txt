@@ -1,0 +1,164 @@
+-- ═══════════════════════════════════════════════════════════════════════════
+-- MOTOR INSURANCE BRMS — Master Tables
+-- DB: PostgreSQL
+-- Supports: Client-specific rules, configurable thresholds, no-code changes
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- ── 1. client_master ──────────────────────────────────────────────────────
+-- 'DEFAULT' client drives the base config. Client-specific rows override it.
+CREATE TABLE client_master (
+    id          BIGSERIAL    PRIMARY KEY,
+    client_id   VARCHAR(50)  NOT NULL,
+    client_name VARCHAR(100) NOT NULL,
+    is_active   BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_client_id UNIQUE (client_id)
+);
+
+-- ── 2. motor_insurance_product ────────────────────────────────────────────
+CREATE TABLE motor_insurance_product (
+    id           BIGSERIAL    PRIMARY KEY,
+    product_code VARCHAR(20)  NOT NULL,   -- PC_LO, TW_LO, GCV_LO, PCV_LO, MISC_LO
+    product_name VARCHAR(100) NOT NULL,
+    is_active    BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at   TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMP    NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_product_code UNIQUE (product_code)
+);
+
+-- ── 3. product_subtype ────────────────────────────────────────────────────
+-- PCV_LO  → STAFF_BUS, SCHOOL_BUS, TAXI, MAXICAB, 3W_AUTO, 3W_AUTO_ELECTRIC
+-- MISC_LO → AGRICULTURAL_TRACTORS, HARVESTORS, OTHERS
+-- PC_LO, TW_LO, GCV_LO → no subtypes (NULL subtype = applies to all)
+CREATE TABLE product_subtype (
+    id           BIGSERIAL    PRIMARY KEY,
+    product_id   BIGINT       NOT NULL REFERENCES motor_insurance_product(id),
+    subtype_code VARCHAR(50)  NOT NULL,
+    subtype_name VARCHAR(100) NOT NULL,
+    is_active    BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at   TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMP    NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_product_subtype UNIQUE (product_id, subtype_code)
+);
+
+-- ── 4. rule_definition ────────────────────────────────────────────────────
+-- Master catalog of all possible rule types.
+-- operator_type drives evaluation logic in RuleEvaluatorEngine.
+CREATE TABLE rule_definition (
+    id                  BIGSERIAL    PRIMARY KEY,
+    rule_code           VARCHAR(60)  NOT NULL,  -- VEHICLE_AGE, CUBIC_CAPACITY, etc.
+    rule_name           VARCHAR(150) NOT NULL,
+    operator_type       VARCHAR(20)  NOT NULL,  -- RANGE, IN_LIST, EXACT, POLICY_TYPE, EXTERNAL_API
+    data_type           VARCHAR(20)  NOT NULL,  -- NUMBER, STRING, LIST, DATE
+    error_message       VARCHAR(500) NOT NULL,  -- exact message to throw on failure
+    is_active           BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMP    NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_rule_code       UNIQUE (rule_code),
+    CONSTRAINT chk_operator_type  CHECK (operator_type IN (
+        'RANGE','IN_LIST','EXACT','POLICY_TYPE','EXTERNAL_API','STATE_LOOKUP'
+    )),
+    CONSTRAINT chk_data_type      CHECK (data_type IN ('NUMBER','STRING','LIST','DATE'))
+);
+
+-- ── 5. client_product_rule_config ────────────────────────────────────────
+-- Core config table. Ties client + product + subtype + rule + thresholds.
+-- subtype_id NULL   → rule applies to all subtypes of that product
+-- client_id DEFAULT → base config; other clients inherit unless overridden
+CREATE TABLE client_product_rule_config (
+    id             BIGSERIAL     PRIMARY KEY,
+    client_id      VARCHAR(50)   NOT NULL REFERENCES client_master(client_id),
+    product_id     BIGINT        NOT NULL REFERENCES motor_insurance_product(id),
+    subtype_id     BIGINT        REFERENCES product_subtype(id),      -- NULL = all subtypes
+    rule_id        BIGINT        NOT NULL REFERENCES rule_definition(id),
+    min_value      VARCHAR(50),   -- RANGE lower bound
+    max_value      VARCHAR(50),   -- RANGE upper bound
+    allowed_values TEXT,          -- comma-separated for IN_LIST / POLICY_TYPE
+    is_mandatory   BOOLEAN       NOT NULL DEFAULT TRUE,
+    is_active      BOOLEAN       NOT NULL DEFAULT TRUE,
+    effective_from DATE          NOT NULL DEFAULT CURRENT_DATE,
+    effective_to   DATE,          -- NULL = open-ended
+    created_at     TIMESTAMP     NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMP     NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_client_product_rule UNIQUE (client_id, product_id, subtype_id, rule_id, effective_from)
+);
+
+-- ── 6. state_master ───────────────────────────────────────────────────────
+CREATE TABLE state_master (
+    id         BIGSERIAL   PRIMARY KEY,
+    state_code VARCHAR(10) NOT NULL,
+    state_name VARCHAR(100) NOT NULL,
+    CONSTRAINT uq_state_code UNIQUE (state_code)
+);
+
+-- ── 7. product_state_business_status ─────────────────────────────────────
+-- Holds the product+subtype+client+state → business status mapping.
+-- Business status drives the STATE_LOOKUP rule outcome.
+-- This replaces your excel sheet data for each product-wise state list.
+CREATE TABLE product_state_business_status (
+    id              BIGSERIAL   PRIMARY KEY,
+    client_id       VARCHAR(50) NOT NULL REFERENCES client_master(client_id),
+    product_id      BIGINT      NOT NULL REFERENCES motor_insurance_product(id),
+    subtype_id      BIGINT      REFERENCES product_subtype(id),    -- NULL = all subtypes
+    state_id        BIGINT      NOT NULL REFERENCES state_master(id),
+    business_status VARCHAR(30) NOT NULL,  -- PREFERRED, NON_PREFERRED, DECLINED
+    is_active       BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMP   NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMP   NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_product_state_status UNIQUE (client_id, product_id, subtype_id, state_id)
+);
+
+-- ── 8. make_model_business_status_config ──────────────────────────────────
+-- Config that tells the engine what business statuses from the
+-- external make/model API are considered DECLINED for a given client+product.
+-- You call external API → get back a status string → match against this table.
+CREATE TABLE make_model_business_status_config (
+    id                      BIGSERIAL   PRIMARY KEY,
+    client_id               VARCHAR(50) NOT NULL REFERENCES client_master(client_id),
+    product_id              BIGINT      NOT NULL REFERENCES motor_insurance_product(id),
+    subtype_id              BIGINT      REFERENCES product_subtype(id),
+    declined_status_values  TEXT        NOT NULL,  -- comma-sep API statuses that = decline
+    is_active               BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at              TIMESTAMP   NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMP   NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_make_model_config UNIQUE (client_id, product_id, subtype_id)
+);
+
+-- ── 9. policy_type_config ─────────────────────────────────────────────────
+-- Drives the POLICY_TYPE rule (Continuous / Breakin variants).
+-- rsd_rule_type: EXPIRY_PLUS_1 | T_PLUS_3_NO_INSPECTION | T_WITH_INSPECTION
+CREATE TABLE policy_type_config (
+    id               BIGSERIAL   PRIMARY KEY,
+    client_id        VARCHAR(50) NOT NULL REFERENCES client_master(client_id),
+    product_id       BIGINT      NOT NULL REFERENCES motor_insurance_product(id),
+    subtype_id       BIGINT      REFERENCES product_subtype(id),
+    policy_type      VARCHAR(30) NOT NULL,  -- CONTINUOUS, BREAKIN_NO_INSPECTION, BREAKIN_WITH_INSPECTION
+    rsd_rule_type    VARCHAR(40) NOT NULL,  -- EXPIRY_PLUS_1, T_PLUS_3_NO_INSPECTION, T_WITH_INSPECTION
+    max_rsd_gap_days INT,                   -- e.g. 3 for T+3
+    is_allowed       BOOLEAN     NOT NULL DEFAULT TRUE,
+    is_active        BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at       TIMESTAMP   NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMP   NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_policy_type_config UNIQUE (client_id, product_id, subtype_id, policy_type)
+);
+
+-- ── 10. rule_evaluation_log ────────────────────────────────────────────────
+CREATE TABLE rule_evaluation_log (
+    id              BIGSERIAL    PRIMARY KEY,
+    transaction_ref VARCHAR(100) NOT NULL,
+    client_id       VARCHAR(50)  NOT NULL,
+    product_id      BIGINT       NOT NULL REFERENCES motor_insurance_product(id),
+    subtype_id      BIGINT       REFERENCES product_subtype(id),
+    rule_code       VARCHAR(60)  NOT NULL,
+    input_value     VARCHAR(500),
+    result          VARCHAR(10)  NOT NULL CHECK (result IN ('PASS','FAIL')),
+    failure_reason  VARCHAR(500),
+    evaluated_at    TIMESTAMP    NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_rel_txn_ref       ON rule_evaluation_log(transaction_ref);
+CREATE INDEX idx_rel_product       ON rule_evaluation_log(product_id);
+CREATE INDEX idx_rel_evaluated_at  ON rule_evaluation_log(evaluated_at);
+CREATE INDEX idx_cprc_lookup       ON client_product_rule_config(client_id, product_id, subtype_id);
+CREATE INDEX idx_psbs_lookup       ON product_state_business_status(client_id, product_id, state_id);
