@@ -1,0 +1,187 @@
+// BRMSOrchestrator.java
+package com.insurance.brms.service;
+
+import com.insurance.brms.config.RuleFieldMappingConfig;
+import com.insurance.brms.dto.BRMSRequest;
+import com.insurance.brms.dto.BRMSResponse;
+import com.insurance.brms.dto.RuleEvaluationResult;
+import com.insurance.brms.engine.RuleEvaluatorEngine;
+import com.insurance.brms.entity.*;
+import com.insurance.brms.repository.*;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.*;
+
+/**
+ * Main orchestrator for BRMS rule evaluation.
+ *
+ * Flow:
+ *   1. Validate and resolve product + subtype from DB
+ *   2. Load all effective rules (client-specific overrides DEFAULT)
+ *   3. For each rule: extract input value → evaluate → log → fail-fast on mandatory failure
+ *   4. Return BRMSResponse with exact error message from DB (no hardcoded messages here)
+ *
+ * Called from your delegate via evaluate(BRMSRequest).
+ * Never throws exceptions — all failures return BRMSResponse with code=200 and error message.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BRMSOrchestrator {
+
+    private final MotorInsuranceProductRepository     productRepo;
+    private final ProductSubtypeRepository            subtypeRepo;
+    private final ClientProductRuleConfigRepository   ruleConfigRepo;
+    private final RuleEvaluationLogRepository         logRepo;
+    private final RuleEvaluatorEngine                 engine;
+    private final RuleFieldMappingConfig              fieldMapping;
+
+    /**
+     * Evaluates all BRMS rules for the given proposal request.
+     * Designed to be called from your delegate class.
+     *
+     * @param request populated BRMSRequest (stateCode already derived from RTO/RC)
+     * @return BRMSResponse — always HTTP 200; message is 'SUCCESS' or exact DB error message
+     */
+    @Transactional
+    public BRMSResponse evaluate(BRMSRequest request) {
+
+        log.info("=== BRMS Evaluation START | txnRef={} | client={} | product={} | subtype={} ===",
+                request.getTransactionRef(), request.getClientId(),
+                request.getProductCode(), request.getSubtypeCode());
+
+        // ── Step 1: Resolve product from DB ──────────────────────────────────
+        MotorInsuranceProduct product = productRepo
+                .findByProductCodeAndIsActiveTrue(request.getProductCode())
+                .orElse(null);
+
+        if (product == null) {
+            log.error("BRMS HALT: Unknown or inactive product [{}] | txnRef={}",
+                    request.getProductCode(), request.getTransactionRef());
+            return BRMSResponse.failure("Technical Glitch");
+        }
+        log.debug("Product resolved: id={} | code={}", product.getId(), product.getProductCode());
+
+        // ── Step 2: Resolve subtype from DB (optional) ────────────────────────
+        // PC_LO, TW_LO, GCV_LO have no subtypes — subtypeCode will be null.
+        // PCV_LO and MISC_LO require a valid subtype.
+        ProductSubtype subtype = null;
+        if (StringUtils.hasText(request.getSubtypeCode())) {
+            subtype = subtypeRepo
+                    .findByProduct_IdAndSubtypeCodeAndIsActiveTrue(
+                            product.getId(), request.getSubtypeCode())
+                    .orElse(null);
+
+            if (subtype == null) {
+                log.error("BRMS HALT: Unknown or inactive subtype [{}] for product [{}] | txnRef={}",
+                        request.getSubtypeCode(), request.getProductCode(), request.getTransactionRef());
+                return BRMSResponse.failure("Technical Glitch");
+            }
+            log.debug("Subtype resolved: id={} | code={}", subtype.getId(), subtype.getSubtypeCode());
+        }
+
+        Long productId = product.getId();
+        Long subtypeId = subtype != null ? subtype.getId() : null;
+
+        // ── Step 3: Load effective rules for this client + product + subtype ──
+        // Query returns rules ordered by priority (client-specific first, subtype-specific first).
+        // De-duplication by rule_code below ensures most specific config wins.
+        List<ClientProductRuleConfig> configs = (subtypeId != null)
+                ? ruleConfigRepo.findEffectiveRules(
+                        request.getClientId(), productId, subtypeId, LocalDate.now())
+                : ruleConfigRepo.findEffectiveRulesNoSubtype(
+                        request.getClientId(), productId, LocalDate.now());
+
+        log.info("Loaded {} rule config(s) for product={} | subtype={} | client={}",
+                configs.size(), request.getProductCode(), request.getSubtypeCode(), request.getClientId());
+
+        if (configs.isEmpty()) {
+            log.warn("No rules configured for product={} | subtype={} | client={}. Allowing by default.",
+                    request.getProductCode(), request.getSubtypeCode(), request.getClientId());
+            return BRMSResponse.success(request.getTransactionRef());
+        }
+
+        // ── Step 4: Evaluate each rule — fail-fast on first mandatory failure ─
+        // Set tracks already-evaluated rule codes to ensure highest-priority
+        // config (client+subtype specific) is used and generic fallbacks are skipped.
+        Set<String> evaluatedRuleCodes = new LinkedHashSet<>();
+
+        for (ClientProductRuleConfig config : configs) {
+            String ruleCode = config.getRule().getRuleCode();
+
+            // Skip if this rule_code was already evaluated by a higher-priority config
+            if (!evaluatedRuleCodes.add(ruleCode)) {
+                log.debug("Skipping rule [{}] — already evaluated by higher-priority config", ruleCode);
+                continue;
+            }
+
+            // Extract input value for simple rules (THRESHOLD, RANGE, IN_LIST)
+            // Returns null for STATE_LOOKUP, EXTERNAL_API, POLICY_TYPE — engine handles those internally
+            String inputValue = fieldMapping.hasMapping(ruleCode)
+                    ? fieldMapping.extractValue(ruleCode, request)
+                    : null;
+
+            log.debug("Evaluating rule [{}] | inputValue=[{}]", ruleCode, inputValue);
+
+            // Delegate to engine for actual evaluation
+            RuleEvaluationResult result = engine.evaluate(config, inputValue, request, productId, subtypeId);
+
+            // Persist audit log — never fails the main flow
+            persistEvaluationLog(request, product, subtype, ruleCode, inputValue, result);
+
+            if (!result.isPassed()) {
+                if (Boolean.TRUE.equals(config.getIsMandatory())) {
+                    // Mandatory rule failed — stop evaluation and return exact DB error message
+                    log.warn("BRMS FAIL — mandatory rule [{}] failed | txnRef={} | message={}",
+                            ruleCode, request.getTransactionRef(), result.getErrorMessage());
+                    return BRMSResponse.failure(result.getErrorMessage());
+                } else {
+                    // Non-mandatory failure — log and continue
+                    log.info("Non-mandatory rule [{}] failed — continuing evaluation | txnRef={}",
+                            ruleCode, request.getTransactionRef());
+                }
+            } else {
+                log.debug("Rule [{}] PASSED | txnRef={}", ruleCode, request.getTransactionRef());
+            }
+        }
+
+        // ── Step 5: All mandatory rules passed ────────────────────────────────
+        log.info("=== BRMS Evaluation PASSED | txnRef={} ===", request.getTransactionRef());
+        return BRMSResponse.success(request.getTransactionRef());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Persist audit log. Wrapped in try-catch — log failure must NEVER
+    // break or roll back the main evaluation transaction.
+    // ─────────────────────────────────────────────────────────────────────────
+    private void persistEvaluationLog(BRMSRequest request,
+                                       MotorInsuranceProduct product,
+                                       ProductSubtype subtype,
+                                       String ruleCode,
+                                       String inputValue,
+                                       RuleEvaluationResult result) {
+        try {
+            logRepo.save(RuleEvaluationLog.builder()
+                    .transactionRef(request.getTransactionRef())
+                    .clientId(request.getClientId())
+                    .product(product)
+                    .subtype(subtype)
+                    .ruleCode(ruleCode)
+                    .inputValue(inputValue)
+                    .result(result.isPassed() ? "PASS" : "FAIL")
+                    .failureReason(result.isPassed() ? null : result.getErrorMessage())
+                    .evaluatedAt(LocalDateTime.now())
+                    .build());
+        } catch (Exception e) {
+            // Intentionally swallowed — audit log failure is non-critical
+            log.error("Failed to persist evaluation log | rule={} | txnRef={} | error={}",
+                    ruleCode, request.getTransactionRef(), e.getMessage());
+        }
+    }
+}
