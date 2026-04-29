@@ -1,0 +1,228 @@
+-- ═══════════════════════════════════════════════════════════════════════════
+-- MOTOR INSURANCE BRMS — Master Tables
+-- Database : PostgreSQL
+-- Strategy : Fully DB-driven rule engine. Zero code change for rule add/
+--            modify/remove. Client-specific overrides via DEFAULT fallback.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 1. CLIENT_MASTER
+--    Holds all clients. 'DEFAULT' is the base config that all clients
+--    fall back to when no client-specific rule is configured.
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE client_master (
+    id          BIGSERIAL    PRIMARY KEY,
+    client_id   VARCHAR(50)  NOT NULL,
+    client_name VARCHAR(100) NOT NULL,
+    is_active   BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_client_id UNIQUE (client_id)
+);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 2. MOTOR_INSURANCE_PRODUCT
+--    PC_LO, TW_LO, GCV_LO, PCV_LO, MISC_LO
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE motor_insurance_product (
+    id           BIGSERIAL    PRIMARY KEY,
+    product_code VARCHAR(20)  NOT NULL,
+    product_name VARCHAR(100) NOT NULL,
+    is_active    BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at   TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMP    NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_product_code UNIQUE (product_code)
+);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 3. PRODUCT_SUBTYPE
+--    PCV_LO  → STAFF_BUS, SCHOOL_BUS, TAXI, MAXICAB, 3W_AUTO, 3W_AUTO_ELEC
+--    MISC_LO → AGRICULTURAL_TRACTORS, HARVESTORS, OTHERS
+--    PC_LO, TW_LO, GCV_LO → no subtypes (subtype_id = NULL in config)
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE product_subtype (
+    id           BIGSERIAL    PRIMARY KEY,
+    product_id   BIGINT       NOT NULL REFERENCES motor_insurance_product(id),
+    subtype_code VARCHAR(50)  NOT NULL,
+    subtype_name VARCHAR(100) NOT NULL,
+    is_active    BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at   TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMP    NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_product_subtype UNIQUE (product_id, subtype_code)
+);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 4. RULE_DEFINITION
+--    Master catalog of every rule type the engine can evaluate.
+--
+--    operator_type     → Tells engine WHICH evaluator strategy to invoke.
+--                        Think of it as: "what kind of check is this?"
+--      THRESHOLD       → Single-sided numeric check. Uses comparison_operator
+--                        + threshold_value in config. e.g. age < 15
+--      RANGE           → Numeric between two bounds. Uses min_value + max_value
+--                        in config. e.g. CC > 1000 AND CC <= 1500
+--      IN_LIST         → Value must exist in a comma-separated allowed list.
+--      STATE_LOOKUP    → Looks up product_state_business_status table.
+--                        Derived from RTO code / RC number in existing flow.
+--      EXTERNAL_API    → Calls external make/model API, checks returned status.
+--      POLICY_TYPE     → Validates RSD date arithmetic for policy type.
+--
+--    comparison_operator → Only for THRESHOLD rules. Tells engine which
+--                          direction the single-sided check goes.
+--      LESS_THAN           → value < threshold
+--      LESS_THAN_EQUAL     → value <= threshold
+--      GREATER_THAN        → value > threshold
+--      GREATER_THAN_EQUAL  → value >= threshold
+--      NULL for all non-THRESHOLD operator types.
+--
+--    error_message → Exact string returned in API response when rule fails.
+--                    Stored here so business can update messages via DB only.
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE rule_definition (
+    id                  BIGSERIAL    PRIMARY KEY,
+    rule_code           VARCHAR(60)  NOT NULL,
+    rule_name           VARCHAR(150) NOT NULL,
+    operator_type       VARCHAR(20)  NOT NULL,
+    comparison_operator VARCHAR(25),
+    data_type           VARCHAR(20)  NOT NULL,
+    error_message       VARCHAR(500) NOT NULL,
+    is_active           BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMP    NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_rule_code UNIQUE (rule_code),
+
+    CONSTRAINT chk_operator_type CHECK (operator_type IN (
+        'THRESHOLD', 'RANGE', 'IN_LIST',
+        'STATE_LOOKUP', 'EXTERNAL_API', 'POLICY_TYPE'
+    )),
+    CONSTRAINT chk_comparison_operator CHECK (
+        comparison_operator IS NULL
+        OR comparison_operator IN (
+            'LESS_THAN', 'LESS_THAN_EQUAL',
+            'GREATER_THAN', 'GREATER_THAN_EQUAL'
+        )
+    ),
+    -- THRESHOLD must always have a comparison_operator
+    CONSTRAINT chk_threshold_needs_operator CHECK (
+        (operator_type = 'THRESHOLD' AND comparison_operator IS NOT NULL)
+        OR operator_type <> 'THRESHOLD'
+    ),
+    CONSTRAINT chk_data_type CHECK (data_type IN ('NUMBER', 'STRING', 'DATE'))
+);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 5. CLIENT_PRODUCT_RULE_CONFIG
+--    The core config table. Ties client + product + subtype + rule + values.
+--
+--    Resolution priority (highest to lowest):
+--      1. client-specific + subtype-specific
+--      2. client-specific + no subtype (product-level)
+--      3. DEFAULT client  + subtype-specific
+--      4. DEFAULT client  + no subtype  ← base fallback
+--
+--    subtype_id NULL   → config applies to all subtypes of that product.
+--    effective_from/to → allows business to schedule future rule changes
+--                        in DB without deployment.
+--
+--    threshold_value   → used for THRESHOLD rules (single bound)
+--    min_value         → used for RANGE rules (lower bound, exclusive per doc)
+--    max_value         → used for RANGE rules (upper bound, inclusive per doc)
+--    allowed_values    → used for IN_LIST rules (comma-separated)
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE client_product_rule_config (
+    id              BIGSERIAL    PRIMARY KEY,
+    client_id       VARCHAR(50)  NOT NULL REFERENCES client_master(client_id),
+    product_id      BIGINT       NOT NULL REFERENCES motor_insurance_product(id),
+    subtype_id      BIGINT       REFERENCES product_subtype(id),
+    rule_id         BIGINT       NOT NULL REFERENCES rule_definition(id),
+    threshold_value VARCHAR(50),
+    min_value       VARCHAR(50),
+    max_value       VARCHAR(50),
+    allowed_values  TEXT,
+    is_mandatory    BOOLEAN      NOT NULL DEFAULT TRUE,
+    is_active       BOOLEAN      NOT NULL DEFAULT TRUE,
+    effective_from  DATE         NOT NULL DEFAULT CURRENT_DATE,
+    effective_to    DATE,
+    created_at      TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMP    NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_client_product_rule
+        UNIQUE (client_id, product_id, subtype_id, rule_id, effective_from)
+);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 6. STATE_MASTER
+--    All Indian states. state_code derived from first 2 chars of RTO code
+--    or RC number — matches your existing flow.
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE state_master (
+    id         BIGSERIAL    PRIMARY KEY,
+    state_code VARCHAR(10)  NOT NULL,
+    state_name VARCHAR(100) NOT NULL,
+    CONSTRAINT uq_state_code UNIQUE (state_code)
+);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 7. PRODUCT_STATE_BUSINESS_STATUS
+--    Replaces your product-wise state Excel sheets.
+--    Maps client + product + subtype + state → business_status.
+--    business_status values: PREFERRED, NON_PREFERRED, DECLINED
+--    Engine declines the proposal only when status = DECLINED.
+--    Same 4-level priority resolution as rule config applies here.
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE product_state_business_status (
+    id              BIGSERIAL    PRIMARY KEY,
+    client_id       VARCHAR(50)  NOT NULL REFERENCES client_master(client_id),
+    product_id      BIGINT       NOT NULL REFERENCES motor_insurance_product(id),
+    subtype_id      BIGINT       REFERENCES product_subtype(id),
+    state_id        BIGINT       NOT NULL REFERENCES state_master(id),
+    business_status VARCHAR(30)  NOT NULL,
+    is_active       BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMP    NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_product_state_status
+        UNIQUE (client_id, product_id, subtype_id, state_id),
+    CONSTRAINT chk_business_status
+        CHECK (business_status IN ('PREFERRED', 'NON_PREFERRED', 'DECLINED'))
+);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 8. MAKE_MODEL_BUSINESS_STATUS_CONFIG
+--    Tells engine which API response statuses mean DECLINED for a given
+--    client + product + subtype. Your external API already returns a
+--    business status string — this table maps that string to a decision.
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE make_model_business_status_config (
+    id                     BIGSERIAL    PRIMARY KEY,
+    client_id              VARCHAR(50)  NOT NULL REFERENCES client_master(client_id),
+    product_id             BIGINT       NOT NULL REFERENCES motor_insurance_product(id),
+    subtype_id             BIGINT       REFERENCES product_subtype(id),
+    declined_status_values TEXT         NOT NULL,
+    is_active              BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at             TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMP    NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_make_model_config
+        UNIQUE (client_id, product_id, subtype_id)
+);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 9. POLICY_TYPE_CONFIG
+--    Drives the POLICY_TYPE rule. Defines which policy types are allowed
+--    and what RSD date arithmetic rule applies.
+--    rsd_rule_type values:
+--      EXPIRY_PLUS_1           → RSD = previous policy expiry + 1 day (Continuous)
+--      T_PLUS_N_NO_INSPECTION  → RSD <= today + max_rsd_gap_days (Breakin, no inspection)
+--      T_WITH_INSPECTION       → RSD = today (Breakin, with inspection)
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE policy_type_config (
+    id               BIGSERIAL    PRIMARY KEY,
+    client_id        VARCHAR(50)  NOT NULL REFERENCES client_master(client_id),
+    product_id       BIGINT       NOT NULL REFERENCES motor_insurance_product(id),
+    subtype_id       BIGINT       REFERENCES product_subtype(id),
+    policy_type      VARCHAR(40)  NOT NULL,
+    rsd_rule_type    VARCHAR(40)  NOT NULL,
+    max_rsd_gap_days INT,
+    is_allowed       BOOLEAN      NOT NULL DEFAULT TRUE,
+    is_active        BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at       TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMP    NOT NULL DEFAULT NOW(),
