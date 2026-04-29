@@ -1,0 +1,197 @@
+-- ── Clients ───────────────────────────────────────────────────────────────
+INSERT INTO client_master (client_id, client_name) VALUES
+('DEFAULT', 'Default Base Configuration');
+
+-- ── Products ──────────────────────────────────────────────────────────────
+INSERT INTO motor_insurance_product (id, product_code, product_name) VALUES
+(1, 'PC_LO',   'Private Car'),
+(2, 'TW_LO',   'Two Wheeler'),
+(3, 'GCV_LO',  'Goods Carrying Vehicle'),
+(4, 'PCV_LO',  'Passenger Carrying Vehicle'),
+(5, 'MISC_LO', 'Miscellaneous Vehicle');
+
+-- ── Subtypes ──────────────────────────────────────────────────────────────
+INSERT INTO product_subtype (product_id, subtype_code, subtype_name) VALUES
+(4, 'STAFF_BUS',        'Staff Bus'),
+(4, 'SCHOOL_BUS',       'School Bus'),
+(4, 'TAXI',             'Taxi'),
+(4, 'MAXICAB',          'Maxicab'),
+(4, 'THREE_W_AUTO',     '3 Wheeler Auto'),
+(4, 'THREE_W_AUTO_ELEC','3 Wheeler Auto Electric'),
+(5, 'AGRI_TRACTORS',    'Agricultural Tractors'),
+(5, 'HARVESTORS',       'Harvestors'),
+(5, 'OTHERS',           'Others');
+
+-- ── Rule Definitions ──────────────────────────────────────────────────────
+-- Read: operator_type = strategy, comparison_operator = direction (THRESHOLD only)
+INSERT INTO rule_definition
+    (rule_code, rule_name, operator_type, comparison_operator, data_type, error_message)
+VALUES
+-- Age < 15 years (applies to all products)
+('VEHICLE_AGE',
+ 'Age of Vehicle',
+ 'THRESHOLD', 'LESS_THAN', 'NUMBER',
+ 'Technical Glitch - Age of vehicle should be less than 15 years'),
+
+-- CC for TW: less than 150cc
+('CUBIC_CAPACITY_TW',
+ 'Cubic Capacity - Two Wheeler',
+ 'THRESHOLD', 'LESS_THAN', 'NUMBER',
+ 'Technical Glitch - Cubic capacity criteria not met'),
+
+-- CC for PC: exceeding 1000 but not exceeding 1500 (range, both bounds)
+('CUBIC_CAPACITY_PC',
+ 'Cubic Capacity - Private Car',
+ 'RANGE', NULL, 'NUMBER',
+ 'Technical Glitch - Cubic capacity must exceed 1000cc and not exceed 1500cc'),
+
+-- GVW for GCV: less than 43 tons
+('GVW',
+ 'Gross Vehicle Weight',
+ 'THRESHOLD', 'LESS_THAN', 'NUMBER',
+ 'Technical Glitch - GVW of vehicle should be less than 43 tons'),
+
+-- Seating: single lower bound (STAFF_BUS/SCHOOL_BUS: > 17, TAXI: > 6)
+('SEATING_CAPACITY_MIN',
+ 'Seating Capacity - Minimum Threshold',
+ 'THRESHOLD', 'GREATER_THAN', 'NUMBER',
+ 'Technical Glitch - Seating capacity criteria not met'),
+
+-- Seating: both bounds (MAXICAB: > 6 and <= 12, 3W_AUTO: <= 6)
+('SEATING_CAPACITY_RANGE',
+ 'Seating Capacity - Range',
+ 'RANGE', NULL, 'NUMBER',
+ 'Technical Glitch - Seating capacity criteria not met'),
+
+-- Vehicle type for TW (SCOOTER / SCOOTERETTE)
+('VEHICLE_TYPE',
+ 'Type of Vehicle - Scooter or Bike',
+ 'IN_LIST', NULL, 'STRING',
+ 'Technical Glitch - Vehicle type not eligible'),
+
+-- State business status lookup (from product-wise state Excel)
+('STATE_LOOKUP',
+ 'Type of State - Business Status',
+ 'STATE_LOOKUP', NULL, 'STRING',
+ 'Technical Glitch'),
+
+-- Make/model external API check
+('MAKE_MODEL',
+ 'Type of Make and Model',
+ 'EXTERNAL_API', NULL, 'STRING',
+ 'Technical Glitch'),
+
+-- Policy type + RSD date validation
+('POLICY_TYPE',
+ 'Type of Policy - Continuous or Breakin',
+ 'POLICY_TYPE', NULL, 'STRING',
+ 'Technical Glitch - Policy type or RSD date not eligible');
+
+-- ── Client Product Rule Config — DEFAULT client ───────────────────────────
+
+-- VEHICLE_AGE: < 15 years — applies to all products, no subtype
+INSERT INTO client_product_rule_config
+    (client_id, product_id, subtype_id, rule_id, threshold_value, is_mandatory, effective_from)
+SELECT 'DEFAULT', p.id, NULL, r.id, '15', TRUE, CURRENT_DATE
+FROM motor_insurance_product p
+CROSS JOIN rule_definition r
+WHERE r.rule_code = 'VEHICLE_AGE';
+
+-- CUBIC_CAPACITY_TW: < 150cc — TW_LO only
+INSERT INTO client_product_rule_config
+    (client_id, product_id, subtype_id, rule_id, threshold_value, is_mandatory, effective_from)
+SELECT 'DEFAULT', p.id, NULL, r.id, '150', TRUE, CURRENT_DATE
+FROM motor_insurance_product p, rule_definition r
+WHERE p.product_code = 'TW_LO' AND r.rule_code = 'CUBIC_CAPACITY_TW';
+
+-- CUBIC_CAPACITY_PC: exceeding 1000 but not exceeding 1500 — PC_LO only
+INSERT INTO client_product_rule_config
+    (client_id, product_id, subtype_id, rule_id, min_value, max_value, is_mandatory, effective_from)
+SELECT 'DEFAULT', p.id, NULL, r.id, '1000', '1500', TRUE, CURRENT_DATE
+FROM motor_insurance_product p, rule_definition r
+WHERE p.product_code = 'PC_LO' AND r.rule_code = 'CUBIC_CAPACITY_PC';
+
+-- GVW: < 43 tons — GCV_LO only
+INSERT INTO client_product_rule_config
+    (client_id, product_id, subtype_id, rule_id, threshold_value, is_mandatory, effective_from)
+SELECT 'DEFAULT', p.id, NULL, r.id, '43', TRUE, CURRENT_DATE
+FROM motor_insurance_product p, rule_definition r
+WHERE p.product_code = 'GCV_LO' AND r.rule_code = 'GVW';
+
+-- SEATING_CAPACITY_MIN > 17 — STAFF_BUS and SCHOOL_BUS
+INSERT INTO client_product_rule_config
+    (client_id, product_id, subtype_id, rule_id, threshold_value, is_mandatory, effective_from)
+SELECT 'DEFAULT', p.id, s.id, r.id, '17', TRUE, CURRENT_DATE
+FROM motor_insurance_product p
+JOIN product_subtype s ON s.product_id = p.id
+CROSS JOIN rule_definition r
+WHERE p.product_code = 'PCV_LO'
+  AND s.subtype_code IN ('STAFF_BUS', 'SCHOOL_BUS')
+  AND r.rule_code = 'SEATING_CAPACITY_MIN';
+
+-- SEATING_CAPACITY_MIN > 6 — TAXI
+INSERT INTO client_product_rule_config
+    (client_id, product_id, subtype_id, rule_id, threshold_value, is_mandatory, effective_from)
+SELECT 'DEFAULT', p.id, s.id, r.id, '6', TRUE, CURRENT_DATE
+FROM motor_insurance_product p
+JOIN product_subtype s ON s.product_id = p.id
+CROSS JOIN rule_definition r
+WHERE p.product_code = 'PCV_LO'
+  AND s.subtype_code = 'TAXI'
+  AND r.rule_code = 'SEATING_CAPACITY_MIN';
+
+-- SEATING_CAPACITY_RANGE: > 6 and <= 12 — MAXICAB
+INSERT INTO client_product_rule_config
+    (client_id, product_id, subtype_id, rule_id, min_value, max_value, is_mandatory, effective_from)
+SELECT 'DEFAULT', p.id, s.id, r.id, '6', '12', TRUE, CURRENT_DATE
+FROM motor_insurance_product p
+JOIN product_subtype s ON s.product_id = p.id
+CROSS JOIN rule_definition r
+WHERE p.product_code = 'PCV_LO'
+  AND s.subtype_code = 'MAXICAB'
+  AND r.rule_code = 'SEATING_CAPACITY_RANGE';
+
+-- SEATING_CAPACITY_RANGE: 0 to <= 6 — 3W_AUTO and 3W_AUTO_ELEC
+INSERT INTO client_product_rule_config
+    (client_id, product_id, subtype_id, rule_id, min_value, max_value, is_mandatory, effective_from)
+SELECT 'DEFAULT', p.id, s.id, r.id, '0', '6', TRUE, CURRENT_DATE
+FROM motor_insurance_product p
+JOIN product_subtype s ON s.product_id = p.id
+CROSS JOIN rule_definition r
+WHERE p.product_code = 'PCV_LO'
+  AND s.subtype_code IN ('THREE_W_AUTO', 'THREE_W_AUTO_ELEC')
+  AND r.rule_code = 'SEATING_CAPACITY_RANGE';
+
+-- VEHICLE_TYPE: SCOOTER or SCOOTERETTE — TW_LO only
+INSERT INTO client_product_rule_config
+    (client_id, product_id, subtype_id, rule_id, allowed_values, is_mandatory, effective_from)
+SELECT 'DEFAULT', p.id, NULL, r.id, 'SCOOTER,SCOOTERETTE', TRUE, CURRENT_DATE
+FROM motor_insurance_product p, rule_definition r
+WHERE p.product_code = 'TW_LO' AND r.rule_code = 'VEHICLE_TYPE';
+
+-- STATE_LOOKUP, MAKE_MODEL, POLICY_TYPE — all products, no subtype (product-level)
+INSERT INTO client_product_rule_config
+    (client_id, product_id, subtype_id, rule_id, is_mandatory, effective_from)
+SELECT 'DEFAULT', p.id, NULL, r.id, TRUE, CURRENT_DATE
+FROM motor_insurance_product p
+CROSS JOIN rule_definition r
+WHERE r.rule_code IN ('STATE_LOOKUP', 'MAKE_MODEL', 'POLICY_TYPE');
+
+-- ── Policy Type Config — DEFAULT, all products ────────────────────────────
+INSERT INTO policy_type_config
+    (client_id, product_id, subtype_id, policy_type, rsd_rule_type, max_rsd_gap_days, is_allowed)
+SELECT 'DEFAULT', p.id, NULL, pt.policy_type, pt.rsd_rule, pt.gap_days, TRUE
+FROM motor_insurance_product p
+CROSS JOIN (VALUES
+    ('CONTINUOUS',              'EXPIRY_PLUS_1',          0),
+    ('BREAKIN_NO_INSPECTION',   'T_PLUS_N_NO_INSPECTION', 3),
+    ('BREAKIN_WITH_INSPECTION', 'T_WITH_INSPECTION',      0)
+) AS pt(policy_type, rsd_rule, gap_days);
+
+-- ── Make Model Business Status Config — DEFAULT, all products ─────────────
+-- External API returns: PREFERRED, NON_PREFERRED, DECLINED
+-- Only DECLINED triggers a failure
+INSERT INTO make_model_business_status_config
+    (client_id, product_id, subtype_id, declined_status_values)
+SELECT 'DEFAULT', p.id, NULL, 'DECLINED'
+FROM motor_insurance_product p;
