@@ -1,0 +1,36 @@
+// BRMSRequest.java
+package com.insurance.brms.dto;
+
+import lombok.*;
+import java.time.LocalDate;
+
+/**
+ * Input to the BRMS rule engine.
+ * Populated by your delegate before calling BRMSOrchestrator.evaluate().
+ * stateCode is already derived from RTO code / RC number in your existing flow.
+ */
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+public class BRMSRequest {
+
+    private String     transactionRef;
+    private String     clientId;           // from calling system; 'DEFAULT' if not client-specific
+
+    // ── Product identifiers ───────────────────────────────────────────────
+    private String     productCode;        // PC_LO, TW_LO, GCV_LO, PCV_LO, MISC_LO
+    private String     subtypeCode;        // SCHOOL_BUS, TAXI etc.; null for PC/TW/GCV
+
+    // ── Vehicle details ───────────────────────────────────────────────────
+    private String     stateCode;          // 2-char code derived from RTO/RC in existing flow
+    private String     make;
+    private String     model;
+    private String     vehicleAge;         // years as string; parsed to double in engine
+    private String     cubicCapacity;      // in CC; applicable for PC_LO and TW_LO
+    private String     seatingCapacity;    // count excluding driver; applicable for PCV_LO
+    private String     gvw;               // gross vehicle weight in tons; GCV_LO only
+    private String     vehicleType;        // SCOOTER, SCOOTERETTE, BIKE; TW_LO only
+
+    // ── Policy details ────────────────────────────────────────────────────
+    private String     policyType;                  // CONTINUOUS, BREAKIN_NO_INSPECTION, BREAKIN_WITH_INSPECTION
+    private LocalDate  riskStartDate;               // RSD
+    private LocalDate  previousPolicyExpiryDate;    // required for CONTINUOUS policy type
+}
