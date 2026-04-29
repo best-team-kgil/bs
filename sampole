@@ -1,0 +1,356 @@
+// RuleEvaluatorEngine.java
+package com.insurance.brms.engine;
+
+import com.insurance.brms.dto.BRMSRequest;
+import com.insurance.brms.dto.RuleEvaluationResult;
+import com.insurance.brms.entity.*;
+import com.insurance.brms.enums.ComparisonOperator;
+import com.insurance.brms.port.MakeModelApiPort;
+import com.insurance.brms.repository.*;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
+
+import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * Generic rule evaluator engine.
+ *
+ * Design contract:
+ *   - This class knows HOW to evaluate operator types (THRESHOLD, RANGE etc.).
+ *   - It does NOT know which products exist, which fields matter, or what values are valid.
+ *   - All values come from ClientProductRuleConfig (loaded from DB).
+ *   - All error messages come from RuleDefinition.errorMessage (stored in DB).
+ *   - Adding a new operator type = add one case to the switch + one private method.
+ *     No other class changes needed.
+ */
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class RuleEvaluatorEngine {
+
+    private final ProductStateBusinessStatusRepository  stateStatusRepo;
+    private final PolicyTypeConfigRepository            policyTypeConfigRepo;
+    private final MakeModelBusinessStatusConfigRepository makeModelConfigRepo;
+    private final MakeModelApiPort                      makeModelApiPort;
+
+    /**
+     * Entry point. Dispatches to the correct evaluator based on operator_type.
+     *
+     * @param config     DB config row (has rule definition + threshold values)
+     * @param inputValue extracted from BRMSRequest via RuleFieldMappingConfig;
+     *                   null for STATE_LOOKUP, EXTERNAL_API, POLICY_TYPE
+     * @param request    full proposal; used by lookup/API/policy evaluators
+     * @param productId  resolved product id (avoids repeated repo lookups)
+     * @param subtypeId  resolved subtype id; null for products without subtype
+     */
+    public RuleEvaluationResult evaluate(ClientProductRuleConfig config,
+                                         String inputValue,
+                                         BRMSRequest request,
+                                         Long productId,
+                                         Long subtypeId) {
+
+        String ruleCode = config.getRule().getRuleCode();
+        String errMsg   = config.getRule().getErrorMessage();
+
+        log.debug("Evaluating rule [{}] | operatorType=[{}] | inputValue=[{}]",
+                ruleCode, config.getRule().getOperatorType(), inputValue);
+
+        return switch (config.getRule().getOperatorType()) {
+            case THRESHOLD    -> evaluateThreshold(ruleCode, inputValue, config, errMsg);
+            case RANGE        -> evaluateRange(ruleCode, inputValue, config, errMsg);
+            case IN_LIST      -> evaluateInList(ruleCode, inputValue, config, errMsg);
+            case STATE_LOOKUP -> evaluateStateLookup(ruleCode, request, productId, subtypeId, errMsg);
+            case EXTERNAL_API -> evaluateMakeModel(ruleCode, request, productId, subtypeId, errMsg);
+            case POLICY_TYPE  -> evaluatePolicyType(ruleCode, request, productId, subtypeId, errMsg);
+        };
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // THRESHOLD — single-sided numeric check
+    // comparison_operator (LESS_THAN / GREATER_THAN etc.) read from rule_definition
+    // threshold_value read from client_product_rule_config
+    // Example: vehicleAge < 15, seatingCapacity > 17, gvw < 43
+    // ─────────────────────────────────────────────────────────────────────────
+    private RuleEvaluationResult evaluateThreshold(String ruleCode,
+                                                    String inputValue,
+                                                    ClientProductRuleConfig config,
+                                                    String errMsg) {
+        if (!StringUtils.hasText(inputValue)) {
+            log.warn("THRESHOLD rule [{}]: input value is blank", ruleCode);
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+        if (!StringUtils.hasText(config.getThresholdValue())) {
+            log.error("THRESHOLD rule [{}]: threshold_value not configured in DB", ruleCode);
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+
+        double value, threshold;
+        try {
+            value     = Double.parseDouble(inputValue.trim());
+            threshold = Double.parseDouble(config.getThresholdValue().trim());
+        } catch (NumberFormatException e) {
+            log.error("THRESHOLD rule [{}]: non-numeric value [{}] or threshold [{}]",
+                    ruleCode, inputValue, config.getThresholdValue());
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+
+        ComparisonOperator op = config.getRule().getComparisonOperator();
+        if (op == null) {
+            log.error("THRESHOLD rule [{}]: comparison_operator is null in rule_definition", ruleCode);
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+
+        boolean passed = switch (op) {
+            case LESS_THAN          -> value <  threshold;
+            case LESS_THAN_EQUAL    -> value <= threshold;
+            case GREATER_THAN       -> value >  threshold;
+            case GREATER_THAN_EQUAL -> value >= threshold;
+        };
+
+        log.debug("THRESHOLD [{}]: value={} {} threshold={} → {}",
+                ruleCode, value, op, threshold, passed ? "PASS" : "FAIL");
+
+        return passed
+                ? RuleEvaluationResult.pass(ruleCode)
+                : RuleEvaluationResult.fail(ruleCode, errMsg);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // RANGE — numeric between two bounds
+    // Per business document:
+    //   min_value is EXCLUSIVE ("exceeding 1000")
+    //   max_value is INCLUSIVE ("not exceeding 1500")
+    // Example: cubicCapacity > 1000 AND cubicCapacity <= 1500
+    // ─────────────────────────────────────────────────────────────────────────
+    private RuleEvaluationResult evaluateRange(String ruleCode,
+                                               String inputValue,
+                                               ClientProductRuleConfig config,
+                                               String errMsg) {
+        if (!StringUtils.hasText(inputValue)) {
+            log.warn("RANGE rule [{}]: input value is blank", ruleCode);
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+
+        double value;
+        try {
+            value = Double.parseDouble(inputValue.trim());
+        } catch (NumberFormatException e) {
+            log.error("RANGE rule [{}]: non-numeric value [{}]", ruleCode, inputValue);
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+
+        // min is exclusive: value must be strictly greater than min
+        boolean minOk = !StringUtils.hasText(config.getMinValue())
+                || value > Double.parseDouble(config.getMinValue().trim());
+
+        // max is inclusive: value must be <= max
+        boolean maxOk = !StringUtils.hasText(config.getMaxValue())
+                || value <= Double.parseDouble(config.getMaxValue().trim());
+
+        boolean passed = minOk && maxOk;
+        log.debug("RANGE [{}]: value={} | min(excl)={} | max(incl)={} → {}",
+                ruleCode, value, config.getMinValue(), config.getMaxValue(),
+                passed ? "PASS" : "FAIL");
+
+        return passed
+                ? RuleEvaluationResult.pass(ruleCode)
+                : RuleEvaluationResult.fail(ruleCode, errMsg);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // IN_LIST — value must be in comma-separated allowed_values list
+    // Example: vehicleType in [SCOOTER, SCOOTERETTE]
+    // ─────────────────────────────────────────────────────────────────────────
+    private RuleEvaluationResult evaluateInList(String ruleCode,
+                                                String inputValue,
+                                                ClientProductRuleConfig config,
+                                                String errMsg) {
+        if (!StringUtils.hasText(inputValue)) {
+            log.warn("IN_LIST rule [{}]: input value is blank", ruleCode);
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+        if (!StringUtils.hasText(config.getAllowedValues())) {
+            log.error("IN_LIST rule [{}]: allowed_values not configured in DB", ruleCode);
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+
+        List<String> allowed = Arrays.stream(config.getAllowedValues().split(","))
+                .map(String::trim)
+                .toList();
+
+        boolean passed = allowed.contains(inputValue.trim().toUpperCase());
+        log.debug("IN_LIST [{}]: value={} | allowedList={} → {}",
+                ruleCode, inputValue, allowed, passed ? "PASS" : "FAIL");
+
+        return passed
+                ? RuleEvaluationResult.pass(ruleCode)
+                : RuleEvaluationResult.fail(ruleCode, errMsg);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STATE_LOOKUP — DB lookup using state code already derived from RTO/RC
+    // Fails only when business_status = 'DECLINED'
+    // PREFERRED and NON_PREFERRED both allow the proposal to proceed.
+    // Safe default: if no config found → FAIL (deny unknown states)
+    // ─────────────────────────────────────────────────────────────────────────
+    private RuleEvaluationResult evaluateStateLookup(String ruleCode,
+                                                      BRMSRequest request,
+                                                      Long productId,
+                                                      Long subtypeId,
+                                                      String errMsg) {
+        if (!StringUtils.hasText(request.getStateCode())) {
+            log.warn("STATE_LOOKUP [{}]: stateCode is blank in request | txnRef={}",
+                    ruleCode, request.getTransactionRef());
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+
+        List<ProductStateBusinessStatus> results = stateStatusRepo.findBusinessStatus(
+                request.getClientId(), productId, subtypeId, request.getStateCode());
+
+        if (results.isEmpty()) {
+            log.warn("STATE_LOOKUP [{}]: no config found | product={} | subtype={} | state={}",
+                    ruleCode, productId, subtypeId, request.getStateCode());
+            return RuleEvaluationResult.fail(ruleCode, errMsg); // safe default: deny
+        }
+
+        String status = results.get(0).getBusinessStatus();
+        log.info("STATE_LOOKUP [{}]: stateCode={} | businessStatus={}",
+                ruleCode, request.getStateCode(), status);
+
+        return "DECLINED".equalsIgnoreCase(status)
+                ? RuleEvaluationResult.fail(ruleCode, errMsg)
+                : RuleEvaluationResult.pass(ruleCode);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // EXTERNAL_API — calls your existing make/model API via MakeModelApiPort
+    // Returned status is checked against declined_status_values in DB config.
+    // Safe default: API failure → FAIL (never allow on unknown status)
+    // ─────────────────────────────────────────────────────────────────────────
+    private RuleEvaluationResult evaluateMakeModel(String ruleCode,
+                                                    BRMSRequest request,
+                                                    Long productId,
+                                                    Long subtypeId,
+                                                    String errMsg) {
+        String apiStatus = null;
+        try {
+            apiStatus = makeModelApiPort.fetchBusinessStatus(
+                    request.getProductCode(), request.getSubtypeCode(),
+                    request.getMake(), request.getModel());
+            log.info("MAKE_MODEL [{}]: apiStatus={} | make={} | model={}",
+                    ruleCode, apiStatus, request.getMake(), request.getModel());
+        } catch (Exception e) {
+            log.error("MAKE_MODEL [{}]: external API call failed | error={}", ruleCode, e.getMessage());
+        }
+
+        if (!StringUtils.hasText(apiStatus)) {
+            log.warn("MAKE_MODEL [{}]: API returned null/blank — defaulting to FAIL", ruleCode);
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+
+        List<MakeModelBusinessStatusConfig> configs =
+                makeModelConfigRepo.findConfig(request.getClientId(), productId, subtypeId);
+
+        if (configs.isEmpty()) {
+            log.warn("MAKE_MODEL [{}]: no declined_status_values config found — defaulting to PASS", ruleCode);
+            return RuleEvaluationResult.pass(ruleCode);
+        }
+
+        List<String> declinedStatuses = Arrays.stream(
+                configs.get(0).getDeclinedStatusValues().split(","))
+                .map(String::trim)
+                .toList();
+
+        boolean declined = declinedStatuses.contains(apiStatus.trim().toUpperCase());
+        log.debug("MAKE_MODEL [{}]: apiStatus={} | declinedList={} → {}",
+                ruleCode, apiStatus, declinedStatuses, declined ? "FAIL" : "PASS");
+
+        return declined
+                ? RuleEvaluationResult.fail(ruleCode, errMsg)
+                : RuleEvaluationResult.pass(ruleCode);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // POLICY_TYPE — validates policy type eligibility and RSD date arithmetic
+    //
+    // CONTINUOUS:              RSD = previousPolicyExpiryDate + 1 day
+    // BREAKIN_NO_INSPECTION:   RSD <= today + max_rsd_gap_days (typically T+3)
+    // BREAKIN_WITH_INSPECTION: RSD = today (T)
+    // ─────────────────────────────────────────────────────────────────────────
+    private RuleEvaluationResult evaluatePolicyType(String ruleCode,
+                                                     BRMSRequest request,
+                                                     Long productId,
+                                                     Long subtypeId,
+                                                     String errMsg) {
+        if (!StringUtils.hasText(request.getPolicyType()) || request.getRiskStartDate() == null) {
+            log.warn("POLICY_TYPE [{}]: policyType or riskStartDate is null | txnRef={}",
+                    ruleCode, request.getTransactionRef());
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+
+        List<PolicyTypeConfig> configs = policyTypeConfigRepo.findPolicyTypeConfig(
+                request.getClientId(), productId, subtypeId, request.getPolicyType());
+
+        if (configs.isEmpty()) {
+            log.warn("POLICY_TYPE [{}]: no config found for policyType={}", ruleCode, request.getPolicyType());
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+
+        PolicyTypeConfig ptConfig = configs.get(0);
+
+        if (!Boolean.TRUE.equals(ptConfig.getIsAllowed())) {
+            log.info("POLICY_TYPE [{}]: policyType={} is not allowed for this product/subtype",
+                    ruleCode, request.getPolicyType());
+            return RuleEvaluationResult.fail(ruleCode, errMsg);
+        }
+
+        LocalDate rsd   = request.getRiskStartDate();
+        LocalDate today = LocalDate.now();
+        boolean rsdValid;
+
+        switch (ptConfig.getRsdRuleType()) {
+
+            case "EXPIRY_PLUS_1" -> {
+                // Continuous: RSD must be exactly one day after previous policy expiry
+                if (request.getPreviousPolicyExpiryDate() == null) {
+                    log.warn("POLICY_TYPE [{}]: CONTINUOUS but previousPolicyExpiryDate is null", ruleCode);
+                    rsdValid = false;
+                } else {
+                    LocalDate expected = request.getPreviousPolicyExpiryDate().plusDays(1);
+                    rsdValid = rsd.equals(expected);
+                    log.debug("POLICY_TYPE CONTINUOUS: rsd={} | expectedRsd={} | valid={}",
+                            rsd, expected, rsdValid);
+                }
+            }
+
+            case "T_PLUS_N_NO_INSPECTION" -> {
+                // Breakin without inspection: RSD must be between today and today + N days
+                int maxGap = ptConfig.getMaxRsdGapDays() != null ? ptConfig.getMaxRsdGapDays() : 3;
+                long gapDays = ChronoUnit.DAYS.between(today, rsd);
+                rsdValid = gapDays >= 0 && gapDays <= maxGap;
+                log.debug("POLICY_TYPE BREAKIN_NO_INSPECTION: rsd={} | today={} | gap={} | maxGap={} | valid={}",
+                        rsd, today, gapDays, maxGap, rsdValid);
+            }
+
+            case "T_WITH_INSPECTION" -> {
+                // Breakin with inspection: RSD must be today
+                rsdValid = rsd.equals(today);
+                log.debug("POLICY_TYPE BREAKIN_WITH_INSPECTION: rsd={} | today={} | valid={}", rsd, today, rsdValid);
+            }
+
+            default -> {
+                log.error("POLICY_TYPE [{}]: unknown rsdRuleType=[{}]", ruleCode, ptConfig.getRsdRuleType());
+                rsdValid = false;
+            }
+        }
+
+        return rsdValid
+                ? RuleEvaluationResult.pass(ruleCode)
+                : RuleEvaluationResult.fail(ruleCode, errMsg);
+    }
+}
