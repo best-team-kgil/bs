@@ -1,0 +1,672 @@
+// RuleDefinition.java
+package com.insurance.brms.entity;
+
+import com.insurance.brms.enums.ComparisonOperator;
+import com.insurance.brms.enums.OperatorType;
+import jakarta.persistence.*;
+import lombok.*;
+
+@Entity
+@Table(name = "rule_definition")
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+public class RuleDefinition {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    /** Unique identifier used by engine to load and evaluate rules. e.g. VEHICLE_AGE */
+    @Column(name = "rule_code", nullable = false, unique = true, length = 60)
+    private String ruleCode;
+
+    @Column(name = "rule_name", nullable = false, length = 150)
+    private String ruleName;
+
+    /** Evaluation strategy — which evaluator method to invoke in the engine. */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "operator_type", nullable = false, length = 20)
+    private OperatorType operatorType;
+
+    /**
+     * Only populated for THRESHOLD rules.
+     * Tells engine which direction the single-sided numeric check goes.
+     * NULL for RANGE, IN_LIST, STATE_LOOKUP, EXTERNAL_API, POLICY_TYPE.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "comparison_operator", length = 25)
+    private ComparisonOperator comparisonOperator;
+
+    @Column(name = "data_type", nullable = false, length = 20)
+    private String dataType;
+
+    /**
+     * Exact API response message when this rule fails.
+     * Business team changes the message via DB — zero code change needed.
+     */
+    @Column(name = "error_message", nullable = false, length = 500)
+    private String errorMessage;
+
+    @Column(name = "is_active", nullable = false)
+    private Boolean isActive;
+}
+
+// ClientProductRuleConfig.java
+package com.insurance.brms.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+import java.time.LocalDate;
+
+@Entity
+@Table(name = "client_product_rule_config")
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+public class ClientProductRuleConfig {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    /** References client_master.client_id — 'DEFAULT' = base config for all clients. */
+    @Column(name = "client_id", nullable = false, length = 50)
+    private String clientId;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "product_id", nullable = false)
+    private MotorInsuranceProduct product;
+
+    /**
+     * NULL means this config applies to all subtypes of the product.
+     * When set, it overrides the product-level (NULL subtype) config for that subtype.
+     */
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "subtype_id")
+    private ProductSubtype subtype;
+
+    /** Fetched EAGER so rule details are available without extra query in engine. */
+    @ManyToOne(fetch = FetchType.EAGER)
+    @JoinColumn(name = "rule_id", nullable = false)
+    private RuleDefinition rule;
+
+    /** For THRESHOLD rules — the single boundary value. e.g. '15' for age < 15. */
+    @Column(name = "threshold_value", length = 50)
+    private String thresholdValue;
+
+    /** For RANGE rules — lower bound. Per business doc: exclusive (exceeding). */
+    @Column(name = "min_value", length = 50)
+    private String minValue;
+
+    /** For RANGE rules — upper bound. Per business doc: inclusive (not exceeding). */
+    @Column(name = "max_value", length = 50)
+    private String maxValue;
+
+    /** For IN_LIST rules — comma-separated values. e.g. 'SCOOTER,SCOOTERETTE'. */
+    @Column(name = "allowed_values", columnDefinition = "TEXT")
+    private String allowedValues;
+
+    /** If true, evaluation stops immediately on failure and error is returned. */
+    @Column(name = "is_mandatory", nullable = false)
+    private Boolean isMandatory;
+
+    @Column(name = "is_active", nullable = false)
+    private Boolean isActive;
+
+    /**
+     * Business team can schedule rule changes by setting future effective_from.
+     * Engine filters: effectiveFrom <= today AND (effectiveTo IS NULL OR effectiveTo >= today).
+     */
+    @Column(name = "effective_from", nullable = false)
+    private LocalDate effectiveFrom;
+
+    @Column(name = "effective_to")
+    private LocalDate effectiveTo;
+}
+
+// ProductSubtype.java
+package com.insurance.brms.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+@Entity
+@Table(name = "product_subtype")
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+public class ProductSubtype {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "product_id", nullable = false)
+    private MotorInsuranceProduct product;
+
+    @Column(name = "subtype_code", nullable = false, length = 50)
+    private String subtypeCode;
+
+    @Column(name = "subtype_name", nullable = false, length = 100)
+    private String subtypeName;
+
+    @Column(name = "is_active", nullable = false)
+    private Boolean isActive;
+}
+
+// ProductStateBusinessStatus.java
+package com.insurance.brms.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+@Entity
+@Table(name = "product_state_business_status")
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+public class ProductStateBusinessStatus {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "client_id", nullable = false, length = 50)
+    private String clientId;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "product_id", nullable = false)
+    private MotorInsuranceProduct product;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "subtype_id")
+    private ProductSubtype subtype;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "state_id", nullable = false)
+    private StateMaster state;
+
+    /** PREFERRED, NON_PREFERRED, DECLINED — only DECLINED triggers rule failure. */
+    @Column(name = "business_status", nullable = false, length = 30)
+    private String businessStatus;
+
+    @Column(name = "is_active", nullable = false)
+    private Boolean isActive;
+}
+
+// MakeModelBusinessStatusConfig.java
+package com.insurance.brms.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+@Entity
+@Table(name = "make_model_business_status_config")
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+public class MakeModelBusinessStatusConfig {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "client_id", nullable = false, length = 50)
+    private String clientId;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "product_id", nullable = false)
+    private MotorInsuranceProduct product;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "subtype_id")
+    private ProductSubtype subtype;
+
+    /** Comma-sep statuses from external API that cause this rule to FAIL. */
+    @Column(name = "declined_status_values", nullable = false, columnDefinition = "TEXT")
+    private String declinedStatusValues;
+
+    @Column(name = "is_active", nullable = false)
+    private Boolean isActive;
+}
+
+// PolicyTypeConfig.java
+package com.insurance.brms.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+@Entity
+@Table(name = "policy_type_config")
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+public class PolicyTypeConfig {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "client_id", nullable = false, length = 50)
+    private String clientId;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "product_id", nullable = false)
+    private MotorInsuranceProduct product;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "subtype_id")
+    private ProductSubtype subtype;
+
+    @Column(name = "policy_type", nullable = false, length = 40)
+    private String policyType;
+
+    @Column(name = "rsd_rule_type", nullable = false, length = 40)
+    private String rsdRuleType;
+
+    /** Only used for T_PLUS_N_NO_INSPECTION. Defaults to 3 in engine if null. */
+    @Column(name = "max_rsd_gap_days")
+    private Integer maxRsdGapDays;
+
+    @Column(name = "is_allowed", nullable = false)
+    private Boolean isAllowed;
+
+    @Column(name = "is_active", nullable = false)
+    private Boolean isActive;
+}
+
+
+// RuleEvaluationLog.java
+package com.insurance.brms.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "rule_evaluation_log")
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+public class RuleEvaluationLog {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "transaction_ref", nullable = false, length = 100)
+    private String transactionRef;
+
+    @Column(name = "client_id", nullable = false, length = 50)
+    private String clientId;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "product_id", nullable = false)
+    private MotorInsuranceProduct product;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "subtype_id")
+    private ProductSubtype subtype;
+
+    @Column(name = "rule_code", nullable = false, length = 60)
+    private String ruleCode;
+
+    @Column(name = "input_value", length = 500)
+    private String inputValue;
+
+    @Column(name = "result", nullable = false, length = 10)
+    private String result; // PASS or FAIL
+
+    @Column(name = "failure_reason", length = 500)
+    private String failureReason;
+
+    @Column(name = "evaluated_at", nullable = false)
+    private LocalDateTime evaluatedAt;
+}
+
+// ClientProductRuleConfigRepository.java
+package com.insurance.brms.repository;
+
+import com.insurance.brms.entity.ClientProductRuleConfig;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+import java.time.LocalDate;
+import java.util.List;
+
+@Repository
+public interface ClientProductRuleConfigRepository
+        extends JpaRepository<ClientProductRuleConfig, Long> {
+
+    /**
+     * Loads all effective rules for a client + product + subtype combination.
+     *
+     * Priority ordering (highest first, engine de-duplicates by rule_code):
+     *   1. client-specific + subtype-specific
+     *   2. client-specific + product-level (subtype NULL)
+     *   3. DEFAULT         + subtype-specific
+     *   4. DEFAULT         + product-level
+     *
+     * The CASE expressions in ORDER BY encode the priority without any code logic.
+     * Engine iterates the list and skips any rule_code already seen (Set<String>).
+     */
+    @Query("""
+            SELECT c FROM ClientProductRuleConfig c
+            JOIN FETCH c.rule r
+            WHERE c.product.id      = :productId
+              AND (c.subtype IS NULL OR c.subtype.id = :subtypeId)
+              AND c.clientId        IN (:clientId, 'DEFAULT')
+              AND c.isActive        = TRUE
+              AND r.isActive        = TRUE
+              AND c.effectiveFrom   <= :today
+              AND (c.effectiveTo IS NULL OR c.effectiveTo >= :today)
+            ORDER BY
+              CASE WHEN c.clientId  = :clientId THEN 0 ELSE 1 END ASC,
+              CASE WHEN c.subtype  IS NOT NULL   THEN 0 ELSE 1 END ASC
+            """)
+    List<ClientProductRuleConfig> findEffectiveRules(
+            @Param("clientId")  String clientId,
+            @Param("productId") Long productId,
+            @Param("subtypeId") Long subtypeId,
+            @Param("today")     LocalDate today);
+
+    /**
+     * Overload for products with no subtype (PC_LO, TW_LO, GCV_LO).
+     * Returns only product-level rules (subtype IS NULL).
+     */
+    @Query("""
+            SELECT c FROM ClientProductRuleConfig c
+            JOIN FETCH c.rule r
+            WHERE c.product.id    = :productId
+              AND c.subtype       IS NULL
+              AND c.clientId      IN (:clientId, 'DEFAULT')
+              AND c.isActive      = TRUE
+              AND r.isActive      = TRUE
+              AND c.effectiveFrom <= :today
+              AND (c.effectiveTo IS NULL OR c.effectiveTo >= :today)
+            ORDER BY
+              CASE WHEN c.clientId = :clientId THEN 0 ELSE 1 END ASC
+            """)
+    List<ClientProductRuleConfig> findEffectiveRulesNoSubtype(
+            @Param("clientId")  String clientId,
+            @Param("productId") Long productId,
+            @Param("today")     LocalDate today);
+}
+
+// ProductStateBusinessStatusRepository.java
+package com.insurance.brms.repository;
+
+import com.insurance.brms.entity.ProductStateBusinessStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+import java.util.List;
+
+@Repository
+public interface ProductStateBusinessStatusRepository
+        extends JpaRepository<ProductStateBusinessStatus, Long> {
+
+    /**
+     * Resolves business status for client + product + subtype + state.
+     * Same 4-level priority as rule config. First result = most specific.
+     */
+    @Query("""
+            SELECT s FROM ProductStateBusinessStatus s
+            WHERE s.product.id      = :productId
+              AND (s.subtype IS NULL OR s.subtype.id = :subtypeId)
+              AND s.state.stateCode = :stateCode
+              AND s.clientId        IN (:clientId, 'DEFAULT')
+              AND s.isActive        = TRUE
+            ORDER BY
+              CASE WHEN s.clientId = :clientId THEN 0 ELSE 1 END ASC,
+              CASE WHEN s.subtype IS NOT NULL   THEN 0 ELSE 1 END ASC
+            """)
+    List<ProductStateBusinessStatus> findBusinessStatus(
+            @Param("clientId")  String clientId,
+            @Param("productId") Long productId,
+            @Param("subtypeId") Long subtypeId,
+            @Param("stateCode") String stateCode);
+}
+
+// PolicyTypeConfigRepository.java
+package com.insurance.brms.repository;
+
+import com.insurance.brms.entity.PolicyTypeConfig;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+import java.util.List;
+
+@Repository
+public interface PolicyTypeConfigRepository
+        extends JpaRepository<PolicyTypeConfig, Long> {
+
+    @Query("""
+            SELECT p FROM PolicyTypeConfig p
+            WHERE p.product.id  = :productId
+              AND (p.subtype IS NULL OR p.subtype.id = :subtypeId)
+              AND p.policyType  = :policyType
+              AND p.clientId    IN (:clientId, 'DEFAULT')
+              AND p.isActive    = TRUE
+            ORDER BY
+              CASE WHEN p.clientId = :clientId THEN 0 ELSE 1 END ASC,
+              CASE WHEN p.subtype IS NOT NULL   THEN 0 ELSE 1 END ASC
+            """)
+    List<PolicyTypeConfig> findPolicyTypeConfig(
+            @Param("clientId")   String clientId,
+            @Param("productId")  Long productId,
+            @Param("subtypeId")  Long subtypeId,
+            @Param("policyType") String policyType);
+}
+
+// MakeModelBusinessStatusConfigRepository.java
+package com.insurance.brms.repository;
+
+import com.insurance.brms.entity.MakeModelBusinessStatusConfig;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+import java.util.List;
+
+@Repository
+public interface MakeModelBusinessStatusConfigRepository
+        extends JpaRepository<MakeModelBusinessStatusConfig, Long> {
+
+    @Query("""
+            SELECT m FROM MakeModelBusinessStatusConfig m
+            WHERE m.product.id = :productId
+              AND (m.subtype IS NULL OR m.subtype.id = :subtypeId)
+              AND m.clientId   IN (:clientId, 'DEFAULT')
+              AND m.isActive   = TRUE
+            ORDER BY
+              CASE WHEN m.clientId = :clientId THEN 0 ELSE 1 END ASC,
+              CASE WHEN m.subtype IS NOT NULL   THEN 0 ELSE 1 END ASC
+            """)
+    List<MakeModelBusinessStatusConfig> findConfig(
+            @Param("clientId")  String clientId,
+            @Param("productId") Long productId,
+            @Param("subtypeId") Long subtypeId);
+}
+
+
+
+
+// BRMSOrchestrator.java
+package com.insurance.brms.service;
+
+import com.insurance.brms.config.RuleFieldMappingConfig;
+import com.insurance.brms.dto.BRMSRequest;
+import com.insurance.brms.dto.BRMSResponse;
+import com.insurance.brms.dto.RuleEvaluationResult;
+import com.insurance.brms.engine.RuleEvaluatorEngine;
+import com.insurance.brms.entity.*;
+import com.insurance.brms.repository.*;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.*;
+
+/**
+ * Main orchestrator for BRMS rule evaluation.
+ *
+ * Flow:
+ *   1. Validate and resolve product + subtype from DB
+ *   2. Load all effective rules (client-specific overrides DEFAULT)
+ *   3. For each rule: extract input value → evaluate → log → fail-fast on mandatory failure
+ *   4. Return BRMSResponse with exact error message from DB (no hardcoded messages here)
+ *
+ * Called from your delegate via evaluate(BRMSRequest).
+ * Never throws exceptions — all failures return BRMSResponse with code=200 and error message.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BRMSOrchestrator {
+
+    private final MotorInsuranceProductRepository     productRepo;
+    private final ProductSubtypeRepository            subtypeRepo;
+    private final ClientProductRuleConfigRepository   ruleConfigRepo;
+    private final RuleEvaluationLogRepository         logRepo;
+    private final RuleEvaluatorEngine                 engine;
+    private final RuleFieldMappingConfig              fieldMapping;
+
+    /**
+     * Evaluates all BRMS rules for the given proposal request.
+     * Designed to be called from your delegate class.
+     *
+     * @param request populated BRMSRequest (stateCode already derived from RTO/RC)
+     * @return BRMSResponse — always HTTP 200; message is 'SUCCESS' or exact DB error message
+     */
+    @Transactional
+    public BRMSResponse evaluate(BRMSRequest request) {
+
+        log.info("=== BRMS Evaluation START | txnRef={} | client={} | product={} | subtype={} ===",
+                request.getTransactionRef(), request.getClientId(),
+                request.getProductCode(), request.getSubtypeCode());
+
+        // ── Step 1: Resolve product from DB ──────────────────────────────────
+        MotorInsuranceProduct product = productRepo
+                .findByProductCodeAndIsActiveTrue(request.getProductCode())
+                .orElse(null);
+
+        if (product == null) {
+            log.error("BRMS HALT: Unknown or inactive product [{}] | txnRef={}",
+                    request.getProductCode(), request.getTransactionRef());
+            return BRMSResponse.failure("Technical Glitch");
+        }
+        log.debug("Product resolved: id={} | code={}", product.getId(), product.getProductCode());
+
+        // ── Step 2: Resolve subtype from DB (optional) ────────────────────────
+        // PC_LO, TW_LO, GCV_LO have no subtypes — subtypeCode will be null.
+        // PCV_LO and MISC_LO require a valid subtype.
+        ProductSubtype subtype = null;
+        if (StringUtils.hasText(request.getSubtypeCode())) {
+            subtype = subtypeRepo
+                    .findByProduct_IdAndSubtypeCodeAndIsActiveTrue(
+                            product.getId(), request.getSubtypeCode())
+                    .orElse(null);
+
+            if (subtype == null) {
+                log.error("BRMS HALT: Unknown or inactive subtype [{}] for product [{}] | txnRef={}",
+                        request.getSubtypeCode(), request.getProductCode(), request.getTransactionRef());
+                return BRMSResponse.failure("Technical Glitch");
+            }
+            log.debug("Subtype resolved: id={} | code={}", subtype.getId(), subtype.getSubtypeCode());
+        }
+
+        Long productId = product.getId();
+        Long subtypeId = subtype != null ? subtype.getId() : null;
+
+        // ── Step 3: Load effective rules for this client + product + subtype ──
+        // Query returns rules ordered by priority (client-specific first, subtype-specific first).
+        // De-duplication by rule_code below ensures most specific config wins.
+        List<ClientProductRuleConfig> configs = (subtypeId != null)
+                ? ruleConfigRepo.findEffectiveRules(
+                        request.getClientId(), productId, subtypeId, LocalDate.now())
+                : ruleConfigRepo.findEffectiveRulesNoSubtype(
+                        request.getClientId(), productId, LocalDate.now());
+
+        log.info("Loaded {} rule config(s) for product={} | subtype={} | client={}",
+                configs.size(), request.getProductCode(), request.getSubtypeCode(), request.getClientId());
+
+        if (configs.isEmpty()) {
+            log.warn("No rules configured for product={} | subtype={} | client={}. Allowing by default.",
+                    request.getProductCode(), request.getSubtypeCode(), request.getClientId());
+            return BRMSResponse.success(request.getTransactionRef());
+        }
+
+        // ── Step 4: Evaluate each rule — fail-fast on first mandatory failure ─
+        // Set tracks already-evaluated rule codes to ensure highest-priority
+        // config (client+subtype specific) is used and generic fallbacks are skipped.
+        Set<String> evaluatedRuleCodes = new LinkedHashSet<>();
+
+        for (ClientProductRuleConfig config : configs) {
+            String ruleCode = config.getRule().getRuleCode();
+
+            // Skip if this rule_code was already evaluated by a higher-priority config
+            if (!evaluatedRuleCodes.add(ruleCode)) {
+                log.debug("Skipping rule [{}] — already evaluated by higher-priority config", ruleCode);
+                continue;
+            }
+
+            // Extract input value for simple rules (THRESHOLD, RANGE, IN_LIST)
+            // Returns null for STATE_LOOKUP, EXTERNAL_API, POLICY_TYPE — engine handles those internally
+            String inputValue = fieldMapping.hasMapping(ruleCode)
+                    ? fieldMapping.extractValue(ruleCode, request)
+                    : null;
+
+            log.debug("Evaluating rule [{}] | inputValue=[{}]", ruleCode, inputValue);
+
+            // Delegate to engine for actual evaluation
+            RuleEvaluationResult result = engine.evaluate(config, inputValue, request, productId, subtypeId);
+
+            // Persist audit log — never fails the main flow
+            persistEvaluationLog(request, product, subtype, ruleCode, inputValue, result);
+
+            if (!result.isPassed()) {
+                if (Boolean.TRUE.equals(config.getIsMandatory())) {
+                    // Mandatory rule failed — stop evaluation and return exact DB error message
+                    log.warn("BRMS FAIL — mandatory rule [{}] failed | txnRef={} | message={}",
+                            ruleCode, request.getTransactionRef(), result.getErrorMessage());
+                    return BRMSResponse.failure(result.getErrorMessage());
+                } else {
+                    // Non-mandatory failure — log and continue
+                    log.info("Non-mandatory rule [{}] failed — continuing evaluation | txnRef={}",
+                            ruleCode, request.getTransactionRef());
+                }
+            } else {
+                log.debug("Rule [{}] PASSED | txnRef={}", ruleCode, request.getTransactionRef());
+            }
+        }
+
+        // ── Step 5: All mandatory rules passed ────────────────────────────────
+        log.info("=== BRMS Evaluation PASSED | txnRef={} ===", request.getTransactionRef());
+        return BRMSResponse.success(request.getTransactionRef());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Persist audit log. Wrapped in try-catch — log failure must NEVER
+    // break or roll back the main evaluation transaction.
+    // ─────────────────────────────────────────────────────────────────────────
+    private void persistEvaluationLog(BRMSRequest request,
+                                       MotorInsuranceProduct product,
+                                       ProductSubtype subtype,
+                                       String ruleCode,
+                                       String inputValue,
+                                       RuleEvaluationResult result) {
+        try {
+            logRepo.save(RuleEvaluationLog.builder()
+                    .transactionRef(request.getTransactionRef())
+                    .clientId(request.getClientId())
+                    .product(product)
+                    .subtype(subtype)
+                    .ruleCode(ruleCode)
+                    .inputValue(inputValue)
+                    .result(result.isPassed() ? "PASS" : "FAIL")
+                    .failureReason(result.isPassed() ? null : result.getErrorMessage())
+                    .evaluatedAt(LocalDateTime.now())
+                    .build());
+        } catch (Exception e) {
+            // Intentionally swallowed — audit log failure is non-critical
+            log.error("Failed to persist evaluation log | rule={} | txnRef={} | error={}",
+                    ruleCode, request.getTransactionRef(), e.getMessage());
+        }
+    }
+}
