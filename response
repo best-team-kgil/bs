@@ -1,0 +1,32 @@
+// BRMSResponse.java
+package com.insurance.brms.dto;
+
+import lombok.*;
+
+/**
+ * Output from the BRMS rule engine.
+ * Always HTTP 200. message is 'SUCCESS' or the exact error_message
+ * from rule_definition table.
+ */
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+public class BRMSResponse {
+
+    private int    code;
+    private String message;
+    private String transactionRef;
+
+    public static BRMSResponse success(String transactionRef) {
+        return BRMSResponse.builder()
+                .code(200)
+                .message("SUCCESS")
+                .transactionRef(transactionRef)
+                .build();
+    }
+
+    public static BRMSResponse failure(String errorMessage) {
+        return BRMSResponse.builder()
+                .code(200)
+                .message(errorMessage)
+                .build();
+    }
+}
